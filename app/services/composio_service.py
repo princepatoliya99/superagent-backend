@@ -155,6 +155,7 @@ class ComposioService(BaseToolService):
                 slug=slug,
                 arguments=arguments,
                 user_id=user_id,
+                version="20251027_00",
             )
             logger.info("Executed tool %s for user %s", slug, user_id)
             return dict(result)

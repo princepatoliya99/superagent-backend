@@ -7,6 +7,7 @@ by simply changing the ``LLM_MODEL`` environment variable.
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 
@@ -46,6 +47,88 @@ class LLMService(BaseLLMService):
         except Exception:
             logger.exception("LLM health-check failed")
             return False
+
+    # ── Schema Sanitization ──
+
+    def _sanitize_schema_for_gemini(self, schema: dict[str, Any]) -> dict[str, Any]:
+        """
+        Sanitize JSON Schema to be compatible with Gemini API.
+        
+        Gemini has stricter requirements than OpenAI and doesn't support:
+        - Complex anyOf/oneOf structures without proper items definitions
+        - Some advanced JSON Schema features
+        
+        This method recursively simplifies schemas to ensure compatibility.
+        """
+        if not isinstance(schema, dict):
+            return schema
+        
+        schema = copy.deepcopy(schema)
+        
+        # Remove problematic anyOf/oneOf and flatten to first option
+        if "anyOf" in schema:
+            # Take the first valid option from anyOf
+            any_of = schema.pop("anyOf")
+            if any_of and isinstance(any_of, list):
+                # Merge first option into schema
+                first_option = any_of[0] if any_of else {}
+                schema.update(first_option)
+        
+        if "oneOf" in schema:
+            # Take the first valid option from oneOf
+            one_of = schema.pop("oneOf")
+            if one_of and isinstance(one_of, list):
+                first_option = one_of[0] if one_of else {}
+                schema.update(first_option)
+        
+        # Recursively sanitize nested schemas
+        if "properties" in schema and isinstance(schema["properties"], dict):
+            schema["properties"] = {
+                k: self._sanitize_schema_for_gemini(v)
+                for k, v in schema["properties"].items()
+            }
+        
+        if "items" in schema and isinstance(schema["items"], dict):
+            schema["items"] = self._sanitize_schema_for_gemini(schema["items"])
+        
+        if "additionalProperties" in schema and isinstance(schema["additionalProperties"], dict):
+            schema["additionalProperties"] = self._sanitize_schema_for_gemini(
+                schema["additionalProperties"]
+            )
+        
+        return schema
+
+    def _sanitize_tools_for_gemini(self, tools: list[Any]) -> list[Any]:
+        """
+        Sanitize tool definitions for Gemini compatibility.
+        
+        Args:
+            tools: OpenAI-compatible tool definitions
+            
+        Returns:
+            Sanitized tool definitions
+        """
+        if not self._model or "gemini" not in self._model.lower():
+            # Only apply sanitization for Gemini models
+            return tools
+        
+        sanitized_tools = []
+        for tool in tools:
+            tool = copy.deepcopy(tool)
+            
+            # Sanitize function parameters schema
+            if (
+                "function" in tool
+                and "parameters" in tool["function"]
+                and isinstance(tool["function"]["parameters"], dict)
+            ):
+                tool["function"]["parameters"] = self._sanitize_schema_for_gemini(
+                    tool["function"]["parameters"]
+                )
+            
+            sanitized_tools.append(tool)
+        
+        return sanitized_tools
 
     # ── Core API ──
 
@@ -88,6 +171,11 @@ class LLMService(BaseLLMService):
             messages=messages,
         )
 
+        # Check if response has choices
+        if not response.choices or len(response.choices) == 0:
+            logger.error(f"LLM returned empty choices. Full response: {response}")
+            raise ValueError(f"LLM returned empty response. Status: {getattr(response, 'status', 'unknown')}")
+
         choice = response.choices[0].message
         return {"role": "assistant", "content": choice.content or ""}
 
@@ -119,11 +207,19 @@ class LLMService(BaseLLMService):
             self._model,
         )
 
+        # Sanitize tools for Gemini compatibility
+        sanitized_tools = self._sanitize_tools_for_gemini(tools)
+
         response = await litellm.acompletion(
             model=self._model,
             messages=messages,
-            tools=tools,
+            tools=sanitized_tools,
         )
+
+        # Check if response has choices
+        if not response.choices or len(response.choices) == 0:
+            logger.error(f"LLM returned empty choices. Full response: {response}")
+            raise ValueError(f"LLM returned empty response. Status: {getattr(response, 'status', 'unknown')}")
 
         choice = response.choices[0].message
         result: dict[str, Any] = {
