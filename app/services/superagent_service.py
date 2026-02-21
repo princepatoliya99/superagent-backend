@@ -402,9 +402,26 @@ class SuperAgentService(BaseService):
                     tool_response_message
                 )
 
-            # If the user needs to authenticate, stop the loop and wait
-            # for them to reconnect after completing OAuth.
+            # If the user needs to authenticate, stop the loop.
+            # Store an assistant message and yield a reply so the frontend
+            # receives the message via WebSocket instead of a bare return.
             if auth_required:
+                auth_pause_msg = (
+                    "I've detected that authentication is required. "
+                    "I've shared the authentication link with you. "
+                    "Once you complete the authentication, I will continue "
+                    "with your original request."
+                )
+                self._conversations.add_message(
+                    cid, ConversationRole.ASSISTANT.value, auth_pause_msg
+                )
+                yield {
+                    "type": "reply",
+                    "data": {
+                        "conversation_id": cid,
+                        "content": auth_pause_msg,
+                    },
+                }
                 return
 
             # Re-call LLM with updated history
@@ -444,3 +461,31 @@ class SuperAgentService(BaseService):
                 "content": final_content,
             },
         }
+
+    async def continue_after_auth(
+        self,
+        user_id: str,
+        conversation_id: str,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """
+        Resume the agentic loop after the user completes OAuth.
+
+        Injects a user message confirming auth completion, then re-runs
+        the full agentic loop on the existing conversation so the LLM
+        picks up where it left off.
+
+        Yields the same event types as ``handle_message``.
+        """
+        self._ensure_initialized()
+
+        continuation_msg = (
+            "I have completed the authentication successfully. "
+            "Please continue with my original request."
+        )
+
+        async for event in self.handle_message(
+            user_id=user_id,
+            message=continuation_msg,
+            conversation_id=conversation_id,
+        ):
+            yield event

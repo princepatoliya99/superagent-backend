@@ -86,19 +86,45 @@ async def ws_chat(websocket: WebSocket) -> None:
                 )
                 continue
 
-            message = payload.get("message", "").strip()
+            msg_type = payload.get("type", "message")
             user_id = payload.get("user_id", "default")
             conversation_id = payload.get("conversation_id")
-
-            if not message:
-                await websocket.send_json(
-                    {"type": "error", "data": {"message": "Empty message"}}
-                )
-                continue
 
             if not superagent_service:
                 await websocket.send_json(
                     {"type": "error", "data": {"message": "SuperAgent not initialized"}}
+                )
+                continue
+
+            # ── Auth-completed: resume the agentic loop ──
+            if msg_type == "auth_completed":
+                if not conversation_id:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "data": {"message": "conversation_id is required for auth_completed"},
+                        }
+                    )
+                    continue
+
+                logger.info(
+                    "Auth completed for user %s, conversation %s — resuming",
+                    user_id,
+                    conversation_id,
+                )
+                async for event in superagent_service.continue_after_auth(
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                ):
+                    await websocket.send_json(event)
+                continue
+
+            # ── Normal chat message ──
+            message = payload.get("message", "").strip()
+
+            if not message:
+                await websocket.send_json(
+                    {"type": "error", "data": {"message": "Empty message"}}
                 )
                 continue
 
