@@ -46,11 +46,28 @@ class ComposioService(BaseToolService):
     STATUS_NOT_FOUND = "not_found"
     STATUS_PARTIAL_SUCCESS = "partial_success"
 
+    # Slugs handled via execute_meta rather than tools.execute
+    META_TOOL_SLUGS = frozenset(
+        {
+            "COMPOSIO_SEARCH_TOOLS",
+            "COMPOSIO_MULTI_EXECUTE_TOOL",
+            "COMPOSIO_MANAGE_CONNECTIONS",
+            "COMPOSIO_WAIT_FOR_CONNECTIONS",
+            "COMPOSIO_REMOTE_WORKBENCH",
+            "COMPOSIO_REMOTE_BASH_TOOL",
+            "COMPOSIO_GET_TOOL_SCHEMAS",
+            "COMPOSIO_UPSERT_RECIPE",
+            "COMPOSIO_GET_RECIPE",
+        }
+    )
+
     def __init__(self) -> None:
         self._api_key: str = settings.COMPOSIO_API_KEY
         self._org_key: str = settings.COMPOSIO_ORG_KEY
         self._base_url: str = settings.COMPOSIO_BASE_URL
         self._composio: Composio | None = None
+        # user_id → session_id mapping (populated by get_session_tools)
+        self._sessions: dict[str, str] = {}
 
     # =====================================================================
     # Lifecycle (BaseService)
@@ -163,6 +180,62 @@ class ComposioService(BaseToolService):
             logger.error("execute_tool_for_user failed (%s): %s", slug, exc)
             return {"data": {}, "error": str(exc), "successful": False}
 
+    def execute_session_meta_tool(
+        self,
+        session_id: str,
+        slug: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Execute a Composio meta tool via the Tool Router session API.
+
+        Meta tools (``COMPOSIO_SEARCH_TOOLS``, ``COMPOSIO_MANAGE_CONNECTIONS``,
+        ``COMPOSIO_MULTI_EXECUTE_TOOL``, etc.) MUST be executed through this
+        method — they are NOT available via ``tools.execute()``.
+
+        Uses ``client.tool_router.session.execute_meta(session_id, slug, arguments)``.
+
+        Args:
+            session_id: Tool Router session ID returned by ``get_session_tools``.
+            slug: Meta tool slug (e.g. ``COMPOSIO_MULTI_EXECUTE_TOOL``).
+            arguments: Tool arguments dict.
+
+        Returns:
+            Result dict with ``data``, ``error``, ``successful`` keys.
+        """
+        self._ensure_initialized()
+        assert self._composio is not None
+
+        try:
+            # Access the low-level composio_client through Composio._client
+            client = self._composio._client  # type: ignore[attr-defined]
+            response = client.tool_router.session.execute_meta(
+                session_id=session_id,
+                slug=slug,  # type: ignore[arg-type]
+                arguments=arguments,
+            )
+            # SessionExecuteMetaResponse — convert to a plain dict
+            result = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+            logger.info(
+                "Executed session meta tool %s (session %s)",
+                slug,
+                session_id,
+            )
+            return result
+        except Exception as exc:
+            logger.error(
+                "execute_session_meta_tool failed (%s, session %s): %s",
+                slug,
+                session_id,
+                exc,
+            )
+            return {"data": {}, "error": str(exc), "successful": False}
+
+    @classmethod
+    def is_meta_tool(cls, slug: str) -> bool:
+        """Return ``True`` if *slug* is a session meta tool."""
+        return slug in cls.META_TOOL_SLUGS
+
     # =====================================================================
     # Session management
     # =====================================================================
@@ -201,6 +274,41 @@ class ComposioService(BaseToolService):
         mcp_url = session.mcp.url
         logger.info("Got Tool Router MCP URL for user %s", user_id)
         return mcp_url
+
+    def get_session_tools(
+        self, user_id: str, toolkits: Optional[list[str]] = None
+    ) -> tuple[list[Any], str]:
+        """
+        Get the Tool Router meta tools for a user session.
+
+        Returns the built-in meta tools (COMPOSIO_SEARCH_TOOLS,
+        COMPOSIO_MANAGE_CONNECTIONS, COMPOSIO_MULTI_EXECUTE_TOOL, …) as
+        OpenAI-compatible function-calling definitions **and** the session_id
+        needed for ``execute_session_meta_tool``.
+
+        Args:
+            user_id: User identifier.
+            toolkits: Optional list of toolkit slugs to scope the session.
+
+        Returns:
+            Tuple of (tool definitions list, session_id string).
+        """
+        self._ensure_initialized()
+        try:
+            session = self.create_session(user_id, toolkits)
+            session_id: str = session.session_id
+            self._sessions[user_id] = session_id  # cache for later lookups
+            tools = session.tools()
+            logger.info(
+                "Retrieved %d session tools for user %s (session %s)",
+                len(tools) if tools else 0,
+                user_id,
+                session_id,
+            )
+            return (tools if tools else [], session_id)
+        except Exception as exc:
+            logger.error("get_session_tools failed for user %s: %s", user_id, exc)
+            return ([], "")
 
     def get_all_toolkits(self, user_id: str) -> list[dict[str, Any]]:
         """Paginate through all available toolkits."""
@@ -302,11 +410,12 @@ class ComposioService(BaseToolService):
             logger.info("Waiting for connection %s for user %s", connection_request_id, user_id)
 
             loop = asyncio.get_running_loop()
+            composio = self._composio  # local reference for type narrowing
             try:
                 connected_account = await asyncio.wait_for(
                     loop.run_in_executor(
                         None,
-                        lambda: self._composio.connected_accounts.wait_for_connection(
+                        lambda: composio.connected_accounts.wait_for_connection(
                             connection_request_id
                         ),
                     ),

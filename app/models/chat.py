@@ -59,7 +59,7 @@ class ChatResponse(BaseModel):
 
     conversation_id: str
     reply: str
-    history: list[Message]
+    history: list[dict[str, Any]]
 
 
 class ConversationSummary(BaseModel):

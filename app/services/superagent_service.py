@@ -1,14 +1,15 @@
 """
 SuperAgent service — agentic orchestrator.
 
-Coordinates LLM, conversation history, and Composio tool search/execution
-in an agentic loop:
+Coordinates LLM, conversation history, Composio Tool Router, and RAG
+context injection in an agentic loop:
 
 1. User sends a message
-2. Search for relevant tools via Composio
-3. LLM decides whether to call a tool or respond directly
-4. If tool_calls → execute each tool → feed results back → LLM responds
-5. Store everything in conversation history
+2. Retrieve relevant RAG context (if enabled) and inject into prompt
+3. Provide Composio Tool Router meta tools to the LLM
+4. LLM decides whether to call a tool or respond directly
+5. If tool_calls → dispatch via ToolExecutor → feed results back → repeat
+6. Store everything in conversation history
 """
 
 from __future__ import annotations
@@ -18,10 +19,11 @@ import json
 import logging
 from typing import Any, AsyncGenerator, Optional
 
-from app.models.conversation import ConversationHistory, ConversationRole
+from app.models.conversation import ConversationRole
 from app.services.composio_service import ComposioService
 from app.services.conversation_service import ConversationService
 from app.services.llm_service import LLMService
+from app.services.tool_executor import ToolExecutor
 from app.services.base.base_service import BaseService
 
 logger = logging.getLogger(__name__)
@@ -29,30 +31,41 @@ logger = logging.getLogger(__name__)
 # Max iterations to prevent infinite tool-call loops
 MAX_TOOL_ITERATIONS = 10
 
-# Maximum number of tools to provide to LLM at once (to avoid context overflow)
-MAX_TOOLS_PER_REQUEST = 12
-
 SYSTEM_PROMPT = (
-    "You are SuperAgent, an intelligent AI assistant with access to real-world tools via Composio.\n\n"
-    "## Your Workflow:\n"
-    "1. **Analyze the Problem**: Break down the user's request into clear sub-problems or tasks\n"
-    "2. **Search for Tools**: For each sub-problem, use the COMPOSIO_SEARCH tool to find relevant tools\n"
-    "3. **Execute Tools**: Use the tools found by COMPOSIO_SEARCH to solve each sub-problem\n"
-    "4. **Synthesize Results**: Combine the results and provide a comprehensive answer\n\n"
-    "## Important Guidelines:\n"
-    "- Always use COMPOSIO_SEARCH first to find the right tools for the task\n"
-    "- Provide clear descriptions in your COMPOSIO_SEARCH query (e.g., 'fetch emails from Gmail', 'create GitHub issue')\n"
-    "- Only use tools that were returned by COMPOSIO_SEARCH\n"
-    "- Explain what you're doing before and after each step\n"
-    "- If COMPOSIO_SEARCH returns no tools, inform the user that the capability isn't available\n\n"
-    "Think step-by-step and use the tools systematically to help the user."
+    "You are SuperAgent, an intelligent AI assistant with access to real-world tools via Composio "
+    "and a knowledge base via RAG.\n\n"
+    "## Your Capabilities:\n"
+    "- **Composio Tools**: You have meta tools (COMPOSIO_SEARCH_TOOLS, COMPOSIO_MANAGE_CONNECTIONS, "
+    "COMPOSIO_MULTI_EXECUTE_TOOL) that let you discover, authenticate, and execute 1000+ external "
+    "tools (Gmail, GitHub, Slack, etc.)\n"
+    "- **Knowledge Base**: Relevant documents from the knowledge base are automatically provided "
+    "as context when available.\n\n"
+    "## MANDATORY Workflow (follow this EXACT order every time you need to use an external tool):\n"
+    "1. **Search for Tools**: Call COMPOSIO_SEARCH_TOOLS to find the right tool for the task.\n"
+    "2. **Manage Connections (ALWAYS REQUIRED)**: Call COMPOSIO_MANAGE_CONNECTIONS with the toolkit "
+    "name(s) to ensure the user has an active authenticated connection. Pass the relevant "
+    "toolkit(s) in the `toolkits` array (e.g. [\"googlecalendar\"]). If the response contains a "
+    "`redirect_url`, share it with the user as a clickable link and **wait** — do NOT proceed to "
+    "execute until the connection is confirmed active.\n"
+    "3. **Execute**: Only AFTER COMPOSIO_MANAGE_CONNECTIONS succeeds, call "
+    "COMPOSIO_MULTI_EXECUTE_TOOL to run the actual tool action.\n"
+    "4. **Synthesize**: Combine tool results and knowledge-base context into a comprehensive answer.\n\n"
+    "## CRITICAL Rules:\n"
+    "- **NEVER skip step 2.** You MUST call COMPOSIO_MANAGE_CONNECTIONS before COMPOSIO_MULTI_EXECUTE_TOOL, "
+    "even if you think the user is already connected. The meta tool handles connection verification internally.\n"
+    "- If COMPOSIO_MANAGE_CONNECTIONS returns a redirect_url, present it to the user as a clickable "
+    "authentication link and tell them to complete the setup before you proceed.\n"
+    "- Always pass the `session_id` returned from previous meta tool calls into subsequent calls.\n"
+    "- Use the provided context from the knowledge base when it's relevant to the question.\n"
+    "- Explain what you're doing at each step.\n\n"
+    "Think step-by-step and use your tools systematically."
 )
 
 
 class SuperAgentService(BaseService):
     """
     Agentic orchestrator that ties together LLM, conversation history,
-    and Composio tool search/execution.
+    Composio Tool Router meta tools, and RAG context injection.
     """
 
     def __init__(
@@ -60,10 +73,12 @@ class SuperAgentService(BaseService):
         llm_service: LLMService,
         conversation_service: ConversationService,
         composio_service: ComposioService,
+        tool_executor: ToolExecutor,
     ) -> None:
         self._llm = llm_service
         self._conversations = conversation_service
         self._composio = composio_service
+        self._tool_executor = tool_executor
 
     # ── Lifecycle ──
 
@@ -75,241 +90,127 @@ class SuperAgentService(BaseService):
 
     # ── Helper methods ──
 
-    def _create_composio_search_tool(self) -> dict[str, Any]:
-        """
-        Create the COMPOSIO_SEARCH tool definition for the LLM.
-        
-        This tool allows the LLM to dynamically search for and discover
-        tools based on the task requirements.
-        """
-        return {
-            "type": "function",
-            "function": {
-                "name": "COMPOSIO_SEARCH",
-                "description": (
-                    "Search for relevant tools in Composio's toolkit catalog. "
-                    "Use this tool to find actions you can perform for specific services "
-                    "(like Gmail, GitHub, Slack, etc.). Returns a list of available tools "
-                    "that match your query. Always use this FIRST before attempting to use any other tools."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": (
-                                "Natural language description of what you want to do. "
-                                "Examples: 'fetch recent emails', 'create a GitHub issue', "
-                                "'send a Slack message', 'list calendar events'"
-                            ),
-                        },
-                    },
-                    "required": ["query"],
-                },
-            },
-        }
-
-    def _extract_toolkit_from_tool(self, tool: dict[str, Any]) -> Optional[str]:
-        """
-        Extract toolkit name from a tool definition.
-        
-        Composio tool names follow the pattern: TOOLKIT_ACTION_NAME
-        e.g., GITHUB_CREATE_ISSUE, GMAIL_FETCH_EMAILS
-        """
-        if "function" in tool and "name" in tool["function"]:
-            tool_name = tool["function"]["name"]
-            # Extract toolkit prefix (everything before first underscore after toolkit name)
-            parts = tool_name.split("_")
-            if len(parts) >= 2:
-                return parts[0].upper()
-        return None
-
-    def _extract_toolkit_from_tool_name(self, tool_name: str) -> Optional[str]:
-        """
-        Extract toolkit name from a tool name string.
-        
-        Composio tool names follow the pattern: TOOLKIT_ACTION_NAME
-        e.g., GITHUB_CREATE_ISSUE -> GITHUB
-        """
-        parts = tool_name.split("_")
-        if len(parts) >= 2:
-            return parts[0].upper()
-        return None
-
-    def _prioritize_and_limit_tools(
+    def _inject_rag_context(
         self,
-        tools: list[dict[str, Any]],
-        user_message: str,
-        max_tools: int = MAX_TOOLS_PER_REQUEST
+        history: list[dict[str, Any]],
+        rag_text: str,
     ) -> list[dict[str, Any]]:
         """
-        Prioritize and limit tools to avoid context overflow.
-        
-        Prioritization criteria:
-        1. Tools from toolkits explicitly mentioned in user message (e.g., "gmail", "github")
-        2. General tools
-        
-        Args:
-            tools: List of tool definitions
-            user_message: User's message (to detect explicit toolkit mentions)
-            max_tools: Maximum number of tools to return
-            
-        Returns:
-            Prioritized and limited list of tools
-        """
-        if len(tools) <= max_tools:
-            return tools
-        
-        # Extract toolkit mentions from user message
-        message_lower = user_message.lower()
-        mentioned_toolkits = set()
-        
-        # Common toolkit keywords users might mention
-        toolkit_keywords = {
-            'gmail': 'GMAIL',
-            'google': 'GMAIL',
-            'github': 'GITHUB',
-            'git': 'GITHUB',
-            'slack': 'SLACK',
-            'email': None,  # Generic, don't prioritize specific toolkit
-            'calendar': 'GOOGLECALENDAR',
-            'drive': 'GOOGLEDRIVE',
-            'sheets': 'GOOGLESHEETS',
-            'jira': 'JIRA',
-            'trello': 'TRELLO',
-        }
-        
-        for keyword, toolkit in toolkit_keywords.items():
-            if keyword in message_lower and toolkit:
-                mentioned_toolkits.add(toolkit)
-        
-        # Separate tools into prioritized and others
-        prioritized = []
-        others = []
-        
-        for tool in tools:
-            toolkit = self._extract_toolkit_from_tool(tool)
-            if toolkit and toolkit in mentioned_toolkits:
-                prioritized.append(tool)
-            else:
-                others.append(tool)
-        
-        # Combine: prioritized tools first, then others up to max_tools
-        result = prioritized[:max_tools]
-        remaining_slots = max_tools - len(result)
-        if remaining_slots > 0:
-            result.extend(others[:remaining_slots])
-        
-        logger.info(
-            f"Prioritized {len(prioritized)} tools (mentioned toolkits: {mentioned_toolkits}), "
-            f"included {len(result)} out of {len(tools)} total tools"
-        )
-        
-        return result
+        Inject RAG context into the conversation history.
 
-    async def _check_connection_status(
-        self, user_id: str, toolkit: str
-    ) -> dict[str, Any]:
+        Adds a system-level context message right after the system prompt
+        (or at the beginning if there is no system message).
         """
-        Check if user has an active connection for a toolkit.
-        
-        Returns:
-            {"connected": bool, "requires_auth": bool, "status": str}
-        """
-        try:
-            # Call the async method directly
-            connected_toolkits = await self._composio.get_connected_toolkits(user_id)
-            
-            # Check if toolkit is in connected list
-            toolkit_lower = toolkit.lower()
-            is_connected = any(
-                self._composio._to_toolkit_slug(tk).lower() == toolkit_lower
-                for tk in connected_toolkits
-            )
-            
-            return {
-                "connected": is_connected,
-                "requires_auth": not is_connected,
-                "status": "connected" if is_connected else "not_connected",
-            }
-        except Exception as exc:
-            logger.warning(f"Failed to check connection status for {toolkit}: {exc}")
-            return {"connected": False, "requires_auth": True, "status": "unknown"}
+        if not rag_text:
+            return history
 
-    async def _handle_toolkit_authorization(
-        self, user_id: str, toolkit: str
-    ) -> AsyncGenerator[dict[str, Any], None]:
+        context_msg = {"role": "system", "content": rag_text}
+
+        # Find insertion point: after the first system message (if any)
+        for i, msg in enumerate(history):
+            if msg.get("role") == "system":
+                updated = history[: i + 1] + [context_msg] + history[i + 1 :]
+                return updated
+
+        # No system message found — prepend
+        return [context_msg] + history
+
+    # ── Auth-required detection ──
+
+    @staticmethod
+    def _extract_auth_info(
+        tool_result: dict[str, Any],
+        tool_args: dict[str, Any],
+    ) -> dict[str, Any] | None:
         """
-        Handle toolkit authorization flow.
+        Inspect a ``COMPOSIO_MANAGE_CONNECTIONS`` result for a redirect URL.
+
+        Returns a ``connection_required`` payload dict if the user still needs to
+        authenticate, or ``None`` if the connection is already active.
+        """
+        logger.debug(f"Checking auth info from tool_result keys: {tool_result.keys()}")
         
-        Yields connection events including auth URL and waits for user to connect.
-        """
-        try:
-            # Request authorization
-            loop = asyncio.get_running_loop()
-            auth_response = await loop.run_in_executor(
-                None, lambda: self._composio.authorize_toolkit(user_id, toolkit)
-            )
-            
-            # Check if auth is required
-            if auth_response.status == self._composio.STATUS_NO_AUTH_REQUIRED:
-                yield {
-                    "type": "connection_established",
-                    "data": {
-                        "toolkit": toolkit,
-                        "message": f"{toolkit} does not require authentication",
-                    },
-                }
-                return
-            
-            # Yield auth URL for user to authenticate
-            yield {
-                "type": "connection_required",
-                "data": {
-                    "toolkit": toolkit,
-                    "redirect_url": auth_response.redirect_url,
-                    "connection_request_id": auth_response.connection_request_id,
-                    "message": f"Please authenticate with {toolkit} using the provided link",
-                },
-            }
-            
-            # Wait for connection with timeout
-            yield {
-                "type": "connection_waiting",
-                "data": {
-                    "toolkit": toolkit,
-                    "message": f"Waiting for {toolkit} authentication...",
-                },
-            }
-            
-            wait_response = await self._composio.wait_for_connection(
-                connection_request_id=auth_response.connection_request_id or "",
-                user_id=user_id,
-                toolkit=toolkit,
-            )
-            
-            if wait_response.status == self._composio.STATUS_CONNECTED:
-                yield {
-                    "type": "connection_established",
-                    "data": {
-                        "toolkit": toolkit,
-                        "message": wait_response.message or f"Successfully connected to {toolkit}",
-                    },
-                }
-            else:
-                yield {
-                    "type": "error",
-                    "data": {
-                        "message": f"Failed to connect to {toolkit}: {wait_response.status}"
-                    },
-                }
+        data = tool_result.get("data") or {}
+
+        # data may itself be a JSON-encoded string
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+                logger.debug(f"Parsed data from string: {data.keys() if isinstance(data, dict) else type(data)}")
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+
+        # The redirect_url can be at the top level or nested inside
+        # a per-toolkit entry
+        redirect_url: str | None = None
+        toolkit: str = ""
+
+        # Check data.redirect_url
+        if isinstance(data, dict) and data.get("redirect_url"):
+            redirect_url = str(data["redirect_url"])
+            logger.debug(f"Found redirect_url in data: {redirect_url}")
+
+        # Also check if the entire tool_result has redirect_url at top level
+        if not redirect_url and tool_result.get("redirect_url"):
+            redirect_url = str(tool_result["redirect_url"])
+            logger.debug(f"Found redirect_url at tool_result top level: {redirect_url}")
+
+        # Check in content field (sometimes Composio returns it here)
+        if not redirect_url and isinstance(data, dict):
+            content = data.get("content")
+            if isinstance(content, dict) and content.get("redirect_url"):
+                redirect_url = str(content["redirect_url"])
+                logger.debug(f"Found redirect_url in data.content: {redirect_url}")
+
+        # Some responses nest per-toolkit results in a list or dict
+        if not redirect_url and isinstance(data, dict):
+            for key in ("results", "toolkits", "connections", "connection_details"):
+                raw = data.get(key)
                 
-        except Exception as exc:
-            logger.exception(f"Authorization failed for {toolkit}")
-            yield {
-                "type": "error",
-                "data": {"message": f"Authorization error for {toolkit}: {exc}"},
-            }
+                # Handle as list
+                if isinstance(raw, list):
+                    for entry in raw:
+                        if isinstance(entry, dict) and entry.get("redirect_url"):
+                            redirect_url = str(entry["redirect_url"])
+                            toolkit = toolkit or str(entry.get("toolkit", ""))
+                            logger.debug(f"Found redirect_url in {key}[list]: {redirect_url}")
+                            break
+                    if redirect_url:
+                        break
+                
+                # Handle as dict (toolkit_name -> toolkit_info)
+                elif isinstance(raw, dict):
+                    for tk_name, tk_info in raw.items():
+                        if isinstance(tk_info, dict) and tk_info.get("redirect_url"):
+                            redirect_url = str(tk_info["redirect_url"])
+                            toolkit = toolkit or str(tk_info.get("toolkit", tk_name))
+                            logger.debug(f"Found redirect_url in {key}[dict][{tk_name}]: {redirect_url}")
+                            break
+                    if redirect_url:
+                        break
+
+        if not redirect_url:
+            logger.debug(f"No redirect_url found. Tool result structure: {json.dumps(tool_result, indent=2)[:500]}")
+            return None
+
+        # Try to derive the toolkit name from the tool arguments
+        if not toolkit:
+            toolkits_arg = tool_args.get("toolkits") or []
+            if isinstance(toolkits_arg, list) and toolkits_arg:
+                toolkit = str(toolkits_arg[0])
+            elif isinstance(toolkits_arg, str):
+                toolkit = toolkits_arg
+
+        logger.info(f"Found redirect_url for toolkit '{toolkit}': {redirect_url}")
+        
+        return {
+            "toolkit": toolkit,
+            "redirect_url": redirect_url,
+            "message": (
+                f"Please connect your {toolkit or 'account'} to continue. "
+                "Click the button below to authenticate."
+            ),
+        }
 
     # ── Core agentic loop ──
 
@@ -323,13 +224,10 @@ class SuperAgentService(BaseService):
         Process a user message through the agentic loop.
 
         Yields intermediate events and the final reply as dicts:
-        - ``{"type": "tool_search", "data": {"query": ..., "tools_found": N, "toolkits": [...]}}``
-        - ``{"type": "connection_status", "data": {"toolkit": ..., "connected": bool, "requires_auth": bool}}``
-        - ``{"type": "connection_required", "data": {"toolkit": ..., "redirect_url": ..., "message": ...}}``
-        - ``{"type": "connection_waiting", "data": {"toolkit": ..., "message": ...}}``
-        - ``{"type": "connection_established", "data": {"toolkit": ..., "message": ...}}``
+        - ``{"type": "rag_context", "data": {"results_count": N}}``
         - ``{"type": "tool_call", "data": {"name": ..., "arguments": ...}}``
         - ``{"type": "tool_result", "data": {"name": ..., "result": ...}}``
+        - ``{"type": "connection_required", "data": {"toolkit": ..., "redirect_url": ..., ...}}``
         - ``{"type": "reply", "data": {"conversation_id": ..., "content": ...}}``
         - ``{"type": "error", "data": {"message": ...}}``
 
@@ -353,21 +251,49 @@ class SuperAgentService(BaseService):
         # 2. Add user message
         self._conversations.add_message(cid, ConversationRole.USER.value, message)
 
-        # 3. Start with COMPOSIO_SEARCH as the only available tool
-        # The LLM will use this to discover other tools dynamically
+        # 3. Retrieve RAG context (auto-injected, not a tool call)
+        rag_context_text = ""
+        if self._tool_executor.is_initialized:
+            rag_results = await self._tool_executor.get_rag_context(message)
+            if rag_results:
+                rag_context_text = ToolExecutor.format_rag_context_for_prompt(rag_results)
+                yield {
+                    "type": "rag_context",
+                    "data": {"results_count": len(rag_results)},
+                }
+
+        # 4. Get Composio Tool Router meta tools
         available_tools: list[Any] = []
-        discovered_tools: dict[str, list[Any]] = {}  # Maps search query to tools
-        
+        session_id: str = ""
         if self._composio.is_initialized:
-            # Add COMPOSIO_SEARCH as the initial tool
-            available_tools = [self._create_composio_search_tool()]
+            try:
+                loop = asyncio.get_running_loop()
+                tools_and_sid = await loop.run_in_executor(
+                    None,
+                    lambda: self._composio.get_session_tools(user_id),
+                )
+                available_tools, session_id = tools_and_sid
+                logger.info(
+                    "Loaded %d Tool Router meta tools for user %s (session %s)",
+                    len(available_tools),
+                    user_id,
+                    session_id,
+                )
+            except Exception as exc:
+                logger.warning("Failed to get session tools: %s", exc)
 
-        # 4. Send to LLM (with or without tools)
+        # 5. Build history with RAG context injected
         history = self._conversations.get_formatted_history_for_model(cid)
+        history = self._inject_rag_context(history, rag_context_text)
 
+        # 6. Initial LLM call
         try:
             if available_tools:
-                logger.debug(f"Calling LLM with {len(available_tools)} tools and {len(history)} messages")
+                logger.debug(
+                    "Calling LLM with %d tools and %d messages",
+                    len(available_tools),
+                    len(history),
+                )
                 llm_response = await self._llm.chat_with_tools_raw(history, available_tools)
             else:
                 llm_response = await self._llm.chat_raw(history)
@@ -376,19 +302,17 @@ class SuperAgentService(BaseService):
             yield {"type": "error", "data": {"message": f"LLM error: {exc}"}}
             return
 
-        # 5. Agentic tool-call loop
+        # 7. Agentic tool-call loop
         iterations = 0
         while llm_response.get("tool_calls") and iterations < MAX_TOOL_ITERATIONS:
             iterations += 1
 
             # Store the assistant message WITH tool_calls in the proper format
-            # This is required for Gemini to match tool responses with tool calls
-            assistant_message = {
+            # (required for Gemini to match tool responses with tool calls)
+            assistant_message: dict[str, Any] = {
                 "role": "assistant",
                 "content": llm_response.get("content") or "",
             }
-            
-            # Add tool_calls if present (required by Gemini)
             if llm_response.get("tool_calls"):
                 assistant_message["tool_calls"] = [
                     {
@@ -396,15 +320,20 @@ class SuperAgentService(BaseService):
                         "type": "function",
                         "function": {
                             "name": tc["name"],
-                            "arguments": json.dumps(tc["arguments"]) if isinstance(tc["arguments"], dict) else tc["arguments"],
-                        }
+                            "arguments": (
+                                json.dumps(tc["arguments"])
+                                if isinstance(tc["arguments"], dict)
+                                else tc["arguments"]
+                            ),
+                        },
                     }
                     for tc in llm_response["tool_calls"]
                 ]
-            
+
             # Add to history manually to preserve tool_calls structure
             self._conversations._conversations[cid].history.append(assistant_message)
 
+            auth_required = False
             for tc in llm_response["tool_calls"]:
                 tool_name = tc["name"]
                 tool_args = tc["arguments"]
@@ -415,186 +344,81 @@ class SuperAgentService(BaseService):
                     "data": {"name": tool_name, "arguments": tool_args},
                 }
 
-                # Handle COMPOSIO_SEARCH specially
-                if tool_name == "COMPOSIO_SEARCH":
-                    search_query = tool_args.get("query", "")
-                    
-                    if not search_query:
-                        tool_result = {
-                            "data": {"tools": [], "message": "No search query provided"},
-                            "error": "Missing query parameter",
-                            "successful": False,
-                        }
-                    else:
-                        try:
-                            # Search for tools
-                            loop = asyncio.get_running_loop()
-                            found_tools = await loop.run_in_executor(
-                                None,
-                                lambda: self._composio.search_tools(user_id, search_query),
-                            )
-                            
-                            # Store discovered tools
-                            discovered_tools[search_query] = found_tools
-                            
-                            # Extract toolkits from found tools (for informational purposes)
-                            toolkits_in_results = set()
-                            for tool in found_tools:
-                                toolkit = self._extract_toolkit_from_tool(tool)
-                                if toolkit:
-                                    toolkits_in_results.add(toolkit)
-                            
-                            # DON'T check connections for all toolkits yet
-                            # Only check when LLM actually tries to use a specific tool
-                            # This prevents unnecessary authorization prompts for tools the LLM won't use
-                            
-                            # Prioritize and limit tools to avoid context overflow
-                            # This filters tools based on user's explicit mentions (e.g., "gmail")
-                            # and limits total number to prevent hitting token limits
-                            prioritized_tools = self._prioritize_and_limit_tools(
-                                found_tools,
-                                message,  # Use original user message for keyword detection
-                                MAX_TOOLS_PER_REQUEST
-                            )
-                            
-                            # Add prioritized tools to available tools
-                            for tool in prioritized_tools:
-                                if tool not in available_tools:
-                                    available_tools.append(tool)
-                            
-                            # Format tool names for response
-                            tool_names = [
-                                t.get("function", {}).get("name", "unknown")
-                                for t in prioritized_tools
-                            ]
-                            
-                            tool_result = {
-                                "data": {
-                                    "tools_found": len(found_tools),
-                                    "tools_available": len(prioritized_tools),
-                                    "tool_names": tool_names,
-                                    "toolkits_available": list(toolkits_in_results),
-                                    "message": (
-                                        f"Found {len(found_tools)} tools for '{search_query}'. "
-                                        f"Providing {len(prioritized_tools)} most relevant tools. "
-                                        f"Available toolkits: {', '.join(toolkits_in_results)}"
-                                    ),
-                                },
-                                "successful": True,
-                            }
-                            
-                            yield {
-                                "type": "tool_search",
-                                "data": {
-                                    "query": search_query,
-                                    "tools_found": len(found_tools),
-                                    "toolkits": list(toolkits_in_results),
-                                },
-                            }
-                            
-                        except Exception as exc:
-                            logger.exception(f"COMPOSIO_SEARCH failed for '{search_query}'")
-                            tool_result = {
-                                "data": {"tools": [], "message": str(exc)},
-                                "error": str(exc),
-                                "successful": False,
-                            }
-                else:
-                    # Execute regular Composio tool
-                    # First check if toolkit is connected
-                    toolkit = self._extract_toolkit_from_tool_name(tool_name)
-                    
-                    if toolkit:
-                        conn_status = await self._check_connection_status(user_id, toolkit)
-                        
-                        yield {
-                            "type": "connection_status",
-                            "data": {
-                                "toolkit": toolkit,
-                                "connected": conn_status["connected"],
-                                "requires_auth": conn_status["requires_auth"],
-                            },
-                        }
-                        
-                        # If not connected, initiate authorization
-                        if not conn_status["connected"]:
-                            auth_successful = False
-                            async for auth_event in self._handle_toolkit_authorization(
-                                user_id, toolkit
-                            ):
-                                yield auth_event
-                                
-                                if auth_event["type"] == "connection_established":
-                                    auth_successful = True
-                                elif auth_event["type"] == "error":
-                                    break
-                            
-                            if not auth_successful:
-                                tool_result = {
-                                    "data": {},
-                                    "error": f"Authorization failed for {toolkit}",
-                                    "successful": False
-                                }
-                                yield {
-                                    "type": "tool_result",
-                                    "data": {"name": tool_name, "result": tool_result},
-                                }
-                                
-                                # Add error to history
-                                tool_response_message = {
-                                    "role": "tool",
-                                    "tool_call_id": tool_call_id,
-                                    "name": tool_name,
-                                    "content": json.dumps(tool_result),
-                                }
-                                self._conversations._conversations[cid].history.append(tool_response_message)
-                                continue
-                    
-                    # Execute the tool
-                    try:
-                        loop = asyncio.get_running_loop()
-                        tool_result = await loop.run_in_executor(
-                            None,
-                            lambda tn=tool_name, ta=tool_args: self._composio.execute_tool_for_user(
-                                slug=tn, arguments=ta, user_id=user_id
-                            ),
-                        )
-                    except Exception as exc:
-                        tool_result = {"data": {}, "error": str(exc), "successful": False}
+                # Dispatch through ToolExecutor
+                tool_result = await self._tool_executor.execute_tool(
+                    name=tool_name,
+                    arguments=tool_args,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
 
                 yield {
                     "type": "tool_result",
                     "data": {"name": tool_name, "result": tool_result},
                 }
 
-                # Add tool result to history in the format Gemini/OpenAI expects
-                # Tool responses must have role="tool", tool_call_id, and content
-                # Some models also expect "name" field
+                # ── Auth-required interception ──
+                # If COMPOSIO_MANAGE_CONNECTIONS returned a redirect_url the
+                # user has NOT yet connected.  Emit a connection_required event so
+                # the UI can render a "Connect" button and stop the loop.
+                if tool_name == "COMPOSIO_MANAGE_CONNECTIONS":
+                    logger.info(f"COMPOSIO_MANAGE_CONNECTIONS result: {json.dumps(tool_result, indent=2)}")
+                    auth_info = self._extract_auth_info(tool_result, tool_args)
+                    if auth_info is not None:
+                        logger.info(f"Emitting connection_required event: {auth_info}")
+                        yield {
+                            "type": "connection_required",
+                            "data": {
+                                "conversation_id": cid,
+                                **auth_info,
+                            },
+                        }
+                        auth_required = True
+                    else:
+                        logger.info("No redirect_url found, connection appears to be established")
+
+                # Add tool result to history (format Gemini/OpenAI expects)
                 tool_response_message = {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "name": tool_name,
                     "content": json.dumps(tool_result),
                 }
-                
-                # Add to history manually to preserve proper structure
-                self._conversations._conversations[cid].history.append(tool_response_message)
+                self._conversations._conversations[cid].history.append(
+                    tool_response_message
+                )
 
-            # Re-call LLM with updated history and available tools
+            # If the user needs to authenticate, stop the loop and wait
+            # for them to reconnect after completing OAuth.
+            if auth_required:
+                return
+
+            # Re-call LLM with updated history
             history = self._conversations.get_formatted_history_for_model(cid)
+            history = self._inject_rag_context(history, rag_context_text)
+
             try:
-                logger.debug(f"Re-calling LLM with {len(history)} messages and {len(available_tools)} tools")
+                logger.debug(
+                    "Re-calling LLM with %d messages and %d tools",
+                    len(history),
+                    len(available_tools),
+                )
                 if available_tools:
-                    llm_response = await self._llm.chat_with_tools_raw(history, available_tools)
+                    llm_response = await self._llm.chat_with_tools_raw(
+                        history, available_tools
+                    )
                 else:
                     llm_response = await self._llm.chat_raw(history)
             except Exception as exc:
                 logger.exception("LLM follow-up call failed")
-                logger.error(f"History at time of failure: {json.dumps(history[-5:], indent=2)}")  # Log last 5 messages
+                logger.error(
+                    "History at time of failure: %s",
+                    json.dumps(history[-5:], indent=2),
+                )
                 yield {"type": "error", "data": {"message": f"LLM error: {exc}"}}
                 return
 
-        # 6. Store the final assistant reply
+        # 8. Store the final assistant reply
         final_content = llm_response.get("content", "")
         self._conversations.add_message(
             cid, ConversationRole.ASSISTANT.value, final_content
