@@ -68,3 +68,35 @@ class CollectionStatsResponse(BaseModel):
     document_count: int = 0
     embedding_dimension: int = 0
     error: Optional[str] = None
+
+
+# ── PDF Upload ──
+
+
+class PDFUploadResponse(BaseModel):
+    """Response for a successful PDF upload and ingestion."""
+
+    filename: str
+    num_chunks: int
+    document_ids: List[str]
+    collection_name: str
+    status: str = "success"
+
+
+# ── PDF List ──
+
+
+class PDFListItem(BaseModel):
+    """A single uploaded PDF entry (aggregated from its chunks)."""
+
+    filename: str
+    file_hash: str
+    num_chunks: int
+    uploaded_at: Optional[str] = None
+
+
+class PDFListResponse(BaseModel):
+    """Response for listing all uploaded PDFs."""
+
+    pdfs: List[PDFListItem]
+    total: int

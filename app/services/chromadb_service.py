@@ -158,8 +158,23 @@ class ChromaDBService(BaseService):
                     clean[k] = v
             processed.append(clean)
 
+        # Generate embeddings for storage using RETRIEVAL_DOCUMENT task type
+        assert self._ef is not None, "Embedding function not initialised"
+        logger.info("Generating embeddings for %d document chunks…", len(documents))
+        embeddings = await asyncio.to_thread(
+            self._ef.get_embeddings, documents, "RETRIEVAL_DOCUMENT"
+        )
+        if not embeddings or len(embeddings) != len(documents):
+            logger.error("Embedding generation failed or returned wrong count")
+            return metrics
+
         def _add():
-            self._collection.add(ids=ids, documents=documents, metadatas=processed)
+            self._collection.add(
+                ids=ids,
+                documents=documents,
+                embeddings=embeddings,
+                metadatas=processed,
+            )
 
         await asyncio.to_thread(_add)
 
@@ -245,6 +260,29 @@ class ChromaDBService(BaseService):
         except Exception as exc:
             logger.error("delete_documents failed: %s", exc)
             return False
+
+    # ── List by source ──
+
+    async def get_documents_by_source(self, source: str) -> List[Dict[str, Any]]:
+        """
+        Return all metadata dicts whose ``source`` field matches *source*.
+
+        Used, for example, to enumerate uploaded PDFs without pulling full
+        document text.
+        """
+        self._ensure_initialized()
+
+        try:
+            results = await asyncio.to_thread(
+                lambda: self._collection.get(
+                    where={"source": source},
+                    include=["metadatas"],
+                )
+            )
+            return results.get("metadatas", []) or []
+        except Exception as exc:
+            logger.error("get_documents_by_source failed: %s", exc)
+            return []
 
     # ── Stats ──
 

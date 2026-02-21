@@ -126,6 +126,50 @@ class ToolExecutor(BaseService):
             "successful": False,
         }
 
+    # ── RAG tool definition (for LLM function-calling) ──
+
+    @staticmethod
+    def get_rag_tool_definition() -> dict:
+        """
+        Return the OpenAI function-calling schema for the RAG_SEARCH tool.
+
+        This is appended to the tool list so the LLM can decide when to
+        search uploaded documents.
+        """
+        return {
+            "type": "function",
+            "function": {
+                "name": "RAG_SEARCH",
+                "description": (
+                    "Search the uploaded document knowledge base for information "
+                    "relevant to the user's query. Use this tool when the user asks "
+                    "questions that might be answered by documents they have uploaded "
+                    "(PDFs, text files, etc.). Returns the most relevant text chunks "
+                    "along with their source metadata and relevance scores."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Natural-language search query to find relevant "
+                                "document chunks in the knowledge base."
+                            ),
+                        },
+                        "n_results": {
+                            "type": "integer",
+                            "description": (
+                                "Maximum number of results to return. "
+                                "Defaults to 5 if not specified."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+
     # ── RAG context helpers ──
 
     async def get_rag_context(

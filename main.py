@@ -24,6 +24,7 @@ from app.services.conversation_service import ConversationService
 from app.services.embedding_service import EmbeddingService
 from app.services.gemini_embedding_service import GeminiEmbeddingService
 from app.services.llm_service import LLMService
+from app.services.pdf_service import PDFService
 from app.services.superagent_service import SuperAgentService
 from app.services.tool_executor import ToolExecutor
 
@@ -44,6 +45,7 @@ composio_service = ComposioService()
 gemini_embedding_service = GeminiEmbeddingService()
 embedding_service = EmbeddingService(gemini_service=gemini_embedding_service)
 chromadb_service = ChromaDBService(gemini_service=gemini_embedding_service)
+pdf_service = PDFService()
 tool_executor = ToolExecutor(
     composio_service=composio_service,
     chromadb_service=chromadb_service,
@@ -76,6 +78,7 @@ async def lifespan(app: FastAPI):
     await gemini_embedding_service.initialize()
     await embedding_service.initialize()
     await chromadb_service.initialize()
+    await pdf_service.initialize()
     await tool_executor.initialize()
 
     # SuperAgent
@@ -91,6 +94,7 @@ async def lifespan(app: FastAPI):
     rag_routes.configure(
         chromadb_service=chromadb_service,
         embedding_service=embedding_service,
+        pdf_service=pdf_service,
     )
 
     logger.info("✅ All services ready.")
@@ -100,6 +104,7 @@ async def lifespan(app: FastAPI):
     logger.info("🛑 Shutting down…")
     await superagent_service.shutdown()
     await tool_executor.shutdown()
+    await pdf_service.shutdown()
     await chromadb_service.shutdown()
     await embedding_service.shutdown()
     await gemini_embedding_service.shutdown()

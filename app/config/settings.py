@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     RAG_TOP_K: int = 5
     RAG_SIMILARITY_THRESHOLD: float = 0.85
 
+    # ── PDF Upload ──
+    PDF_CHUNK_SIZE: int = 1000
+    PDF_CHUNK_OVERLAP: int = 200
+    PDF_MAX_FILE_SIZE_MB: int = 50
+
     # ── Server ──
     HOST: str = "0.0.0.0"
     PORT: int = 5050
