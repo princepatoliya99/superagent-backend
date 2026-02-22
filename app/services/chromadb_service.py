@@ -168,20 +168,50 @@ class ChromaDBService(BaseService):
             logger.error("Embedding generation failed or returned wrong count")
             return metrics
 
+        # Filter out items whose embeddings are empty (failed generation).
+        # embed_batch returns [] for texts that couldn't be embedded, and
+        # ChromaDB will raise "list index out of range" on empty vectors.
+        valid = [
+            (i, doc, emb, meta)
+            for i, (doc, emb, meta) in enumerate(zip(documents, embeddings, processed))
+            if emb  # skip empty embeddings
+        ]
+
+        if not valid:
+            logger.error("All embeddings failed — nothing to add")
+            return metrics
+
+        if len(valid) < len(documents):
+            skipped = len(documents) - len(valid)
+            logger.warning(
+                "Skipping %d/%d chunks with failed embeddings",
+                skipped,
+                len(documents),
+            )
+
+        valid_ids = [ids[i] for i, *_ in valid]
+        valid_docs = [doc for _, doc, _, _ in valid]
+        valid_embs = [emb for _, _, emb, _ in valid]
+        valid_meta = [meta for _, _, _, meta in valid]
+
         def _add():
             self._collection.add(
-                ids=ids,
-                documents=documents,
-                embeddings=embeddings,
-                metadatas=processed,
+                ids=valid_ids,
+                documents=valid_docs,
+                embeddings=valid_embs,
+                metadatas=valid_meta,
             )
 
         await asyncio.to_thread(_add)
 
         latency = (time.time() - t0) * 1000
-        metrics.update(success=True, total_latency_ms=round(latency, 2))
+        metrics.update(
+            success=True,
+            total_chunks=len(valid_ids),
+            total_latency_ms=round(latency, 2),
+        )
         logger.info(
-            "Added %d documents to ChromaDB (%.2f ms)", len(documents), latency
+            "Added %d documents to ChromaDB (%.2f ms)", len(valid_ids), latency
         )
         return metrics
 
