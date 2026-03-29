@@ -34,10 +34,6 @@ To run this project on your local machine, you will need to set up both the back
 
 Navigate to the backend directory, set up your virtual environment, and install the required Python dependencies.
 
-```bash
-# Clone the repo and navigate to the backend
-git clone https://github.com/ACM-PDEU-Student-Chapter/superagent-backend.git
-cd superagent-backend
 
 # Set up the virtual environment
 python -m venv venv
