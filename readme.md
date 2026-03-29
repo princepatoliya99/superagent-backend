@@ -1,6 +1,6 @@
-# 🤖 AI Superagent - ACM Build Your Resume (BYR)
+# 🤖 AI Superagent 
 
-Welcome to the official repository for the **AI Superagent**! This project was built as the major showcase project for the ACM Club's **Build Your Resume (BYR)** series, focusing on practical applications of cutting-edge AI technologies.
+Welcome to the official repository for the **AI Superagent**! This project was built as the major showcase project for focusing on practical applications of cutting-edge AI technologies.
 
 This repository serves as an open-source foundation for students, developers, and AI enthusiasts to learn, experiment, and contribute to a real-world AI application.
 
